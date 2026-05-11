@@ -5,7 +5,7 @@ import {
 import { css } from "@emotion/react";
 import { isNumber, isString, throttle } from "lodash";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PreloadedQuery } from "react-relay";
 import { graphql, usePaginationFragment, usePreloadedQuery } from "react-relay";
 import {
@@ -26,13 +26,17 @@ import {
   ListBox,
   ListBoxItem,
   Loading,
+  Modal,
+  ModalOverlay,
   Text,
   Truncate,
   View,
 } from "@phoenix/components";
 import { AnnotationSummaryGroupTokens } from "@phoenix/components/annotation/AnnotationSummaryGroup";
+import { TraceAnnotationSummaryGroupTokens } from "@phoenix/components/annotation/TraceAnnotationSummaryGroup";
 import { DynamicContent } from "@phoenix/components/DynamicContent";
 import { compactResizeHandleCSS } from "@phoenix/components/resize";
+import { EditSpanAnnotationsDialog } from "@phoenix/components/trace/EditSpanAnnotationsDialog";
 import { LatencyText } from "@phoenix/components/trace/LatencyText";
 import { SpanCumulativeTokenCount } from "@phoenix/components/trace/SpanCumulativeTokenCount";
 import { TokenCosts } from "@phoenix/components/trace/TokenCosts";
@@ -55,9 +59,9 @@ import { SESSION_DETAILS_PAGE_SIZE } from "@phoenix/pages/trace/constants";
 import { isStringKeyedObject } from "@phoenix/typeUtils";
 import { safelyParseJSON } from "@phoenix/utils/jsonUtils";
 
-import { EditSpanAnnotationsButton } from "./EditSpanAnnotationsButton";
 import { SessionViewTabs } from "./SessionViewTabs";
 import type { SessionView } from "./SessionViewTabs";
+import { TraceFeedbackActionToolbar } from "./TraceFeedbackActionToolbar";
 
 export const sessionDetailsTraceListQuery = graphql`
   query SessionDetailsTraceListQuery($id: ID!, $first: Int!) {
@@ -212,6 +216,8 @@ function RootSpanTraceLink({
 }
 
 function RootSpanOutputMetadata({ rootSpan }: RootSpanProps) {
+  const [isAnnotationDialogOpen, setIsAnnotationDialogOpen] = useState(false);
+
   return (
     <Flex direction="column" gap="size-100">
       <Flex
@@ -236,19 +242,34 @@ function RootSpanOutputMetadata({ rootSpan }: RootSpanProps) {
             <LatencyText latencyMs={rootSpan.latencyMs} />
           ) : null}
         </Flex>
-        <span>
-          <EditSpanAnnotationsButton
-            size="S"
+        <TraceFeedbackActionToolbar
+          trace={rootSpan.trace}
+          onAnnotate={() => {
+            setIsAnnotationDialogOpen(true);
+          }}
+        />
+      </Flex>
+      <ModalOverlay
+        isOpen={isAnnotationDialogOpen}
+        onOpenChange={setIsAnnotationDialogOpen}
+      >
+        <Modal variant="slideover" size="L">
+          <EditSpanAnnotationsDialog
             spanNodeId={rootSpan.id}
             projectId={rootSpan.project.id}
-            buttonText="Annotate"
           />
-        </span>
+        </Modal>
+      </ModalOverlay>
+      <Flex direction="row" gap="size-50" wrap="wrap">
+        <TraceAnnotationSummaryGroupTokens
+          trace={rootSpan.trace}
+          renderEmptyState={() => null}
+        />
+        <AnnotationSummaryGroupTokens
+          span={rootSpan}
+          renderEmptyState={() => null}
+        />
       </Flex>
-      <AnnotationSummaryGroupTokens
-        span={rootSpan}
-        renderEmptyState={() => null}
-      />
     </Flex>
   );
 }
@@ -495,6 +516,8 @@ export function SessionDetailsTraceList({
               rootSpan {
                 trace {
                   id
+                  ...TraceAnnotationSummaryGroup
+                  ...TraceFeedbackActionToolbar_trace
                   costSummary {
                     total {
                       cost
