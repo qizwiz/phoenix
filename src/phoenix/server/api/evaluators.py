@@ -59,6 +59,10 @@ from phoenix.server.api.input_types.PromptVersionInput import (
 from phoenix.server.api.types.ChatCompletionMessageRole import ChatCompletionMessageRole
 from phoenix.server.api.types.ChatCompletionSubscriptionPayload import ToolCallChunk
 from phoenix.server.sandbox import MissingSecretError  # noqa: E402
+from phoenix.server.sandbox.session_manager import (
+    SandboxSessionManager,
+    SessionLimitExceeded,
+)
 from phoenix.server.sandbox.types import ExecutionResult, SandboxBackend, UnsupportedOperation
 
 logger = logging.getLogger(__name__)
@@ -729,6 +733,7 @@ async def get_evaluators(
     session: AsyncSession,
     decrypt: Callable[[bytes], bytes],
     credentials: Sequence[GenerativeCredentialInput] | None = None,
+    sandbox_session_manager: Optional[SandboxSessionManager] = None,
 ) -> list[BaseEvaluator]:
     """
     Get all evaluators for the given DatasetEvaluator row IDs.
@@ -895,6 +900,7 @@ async def get_evaluators(
                     sandbox_backend=backend,
                     language=language,
                     timeout=sandbox_timeout,
+                    sandbox_session_manager=sandbox_session_manager,
                 )
                 code_evaluators_by_id[code_row.id] = runner
 
@@ -2539,6 +2545,8 @@ class CodeEvaluatorRunner(BaseEvaluator):
         sandbox_backend: "SandboxBackend",
         language: str,
         timeout: Optional[int] = None,
+        session_key: Optional[str] = None,
+        sandbox_session_manager: Optional[SandboxSessionManager] = None,
     ) -> None:
         self._name = name
         self._description = description
@@ -2547,6 +2555,14 @@ class CodeEvaluatorRunner(BaseEvaluator):
         self._sandbox_backend: SandboxBackend = sandbox_backend
         self._language = language.upper()
         self._timeout = timeout
+        # Optional override for the backend session key. When None, the runner
+        # falls back to ``self._name`` (preserves backward-compat for stored
+        # and dataset paths whose names are DB-stable).
+        self._session_key_override = session_key
+        # Optional manager-mediated execution. When None, the runner calls the
+        # backend directly (preserves legacy callers and tests not yet plumbed
+        # through the manager).
+        self._sandbox_session_manager = sandbox_session_manager
 
     @property
     def name(self) -> str:
@@ -2711,10 +2727,18 @@ class CodeEvaluatorRunner(BaseEvaluator):
             else:
                 code = self._build_typescript_harness(mapped_inputs)
 
+            # Manager-mediated session reuse (D3/D6). When the runner is
+            # plumbed with a manager, an explicit ``session_key`` overrides
+            # ``self._name`` so the inline-evaluator path can survive a
+            # rename mid-iteration without fragmenting sessions (Q3).
+            session_key = (
+                self._session_key_override if self._session_key_override is not None else self._name
+            )
+
             sandbox_metadata: dict[str, Any] = {
                 "backend_type": type(self._sandbox_backend).__name__,
                 "language": self._language,
-                "session_key": self._name,
+                "session_key": session_key,
             }
             if self._timeout is not None:
                 sandbox_metadata["timeout"] = int(self._timeout)
@@ -2741,15 +2765,47 @@ class CodeEvaluatorRunner(BaseEvaluator):
                 set_status_on_exception=False,
             ) as sandbox_span:
                 try:
-                    execution = await asyncio.wait_for(
-                        self._sandbox_backend.execute(
-                            code,
-                            session_key=self._name,
+                    if self._sandbox_session_manager is not None:
+                        # Manager-mediated: ref-counted acquire/release wraps
+                        # the backend execute. The asyncio.wait_for stays
+                        # OUTSIDE acquire so cancellation flows through the
+                        # manager's release-on-cancellation path.
+                        async with self._sandbox_session_manager.acquire(
+                            self._sandbox_backend, session_key
+                        ) as session:
+                            execution = await asyncio.wait_for(
+                                session.execute(code, timeout=self._timeout),
+                                timeout=self._timeout,
+                            )
+                    else:
+                        # Back-compat path for callers / tests not yet plumbed
+                        # through the manager.
+                        execution = await asyncio.wait_for(
+                            self._sandbox_backend.execute(
+                                code,
+                                session_key=session_key,
+                                timeout=self._timeout,
+                            ),
                             timeout=self._timeout,
-                        ),
-                        timeout=self._timeout,
-                    )
+                        )
+                except SessionLimitExceeded as exc:
+                    err = SessionLimitExceeded.MESSAGE
+                    _record_masked_exception(sandbox_span, exc, masker)
+                    _set_masked_status(sandbox_span, StatusCode.ERROR, err, masker)
+                    _record_masked_exception(evaluator_span, exc, masker)
+                    _set_masked_status(evaluator_span, StatusCode.ERROR, err, masker)
+                    return [
+                        self._make_error_result(name, err, start_time, trace_id=trace_id)
+                        for _ in (output_configs or [None])  # type: ignore[list-item]
+                    ]
                 except asyncio.TimeoutError as exc:
+                    # The manager's release-on-cancellation (acquire's finally)
+                    # decrements the in-flight count but does NOT fire
+                    # stop_session — teardown stays the runner's responsibility
+                    # via the existing fire-and-forget path. ``self._name``
+                    # remains the argument here to preserve the original
+                    # behavior for the user-typed-name path; the manager keys
+                    # by ``session_key`` separately.
                     asyncio.create_task(
                         _stop_session_quietly(self._sandbox_backend, self._name, logger)
                     )

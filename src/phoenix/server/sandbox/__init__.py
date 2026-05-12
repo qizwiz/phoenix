@@ -53,7 +53,43 @@ from phoenix.server.sandbox.types import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from phoenix.server.sandbox.session_manager import SandboxSessionManager
+
 logger = logging.getLogger(__name__)
+
+
+# Module-level handle to the app's SandboxSessionManager. Set during
+# lifespan startup via ``register_session_manager``; cleared during shutdown.
+# Invalidation paths (``invalidate_backend_cache``,
+# ``invalidate_backend_cache_for_key``, ``close_all_backends``) consult this
+# handle so that backend eviction also drains in-flight sandbox sessions
+# before ``backend.close()`` runs. ``None`` is a valid state — invalidation
+# falls back to the legacy close-only flow for tests / contexts where the
+# manager hasn't been wired (e.g. ``get_or_create_backend`` called from a
+# script). A module-level handle is used (rather than threading through
+# ``info.context``) because ``close_all_backends`` is registered as a
+# shutdown callback that has no GraphQL info / FastAPI request scope.
+_session_manager: Optional["SandboxSessionManager"] = None
+
+
+def register_session_manager(manager: "SandboxSessionManager") -> None:
+    """Register the app-scoped ``SandboxSessionManager`` for invalidation routing.
+
+    Called once during lifespan startup, immediately after the manager is
+    constructed. Subsequent calls overwrite the prior handle — tests that
+    construct a manager fixture must clear it via ``unregister_session_manager``
+    in teardown to avoid bleeding state across tests.
+    """
+    global _session_manager
+    _session_manager = manager
+
+
+def unregister_session_manager() -> None:
+    """Clear the module-level ``SandboxSessionManager`` handle.
+
+    Safe to call when no manager is registered."""
+    global _session_manager
+    _session_manager = None
 
 
 # JSON Schema "type" → ConfigFieldSpec.field_type mapping.
@@ -412,7 +448,26 @@ def register_sandbox_adapter(adapter: SandboxAdapter) -> SandboxAdapter:
 
 
 async def close_all_backends() -> None:
-    """Close all cached SandboxBackend instances and clear the cache."""
+    """Close all cached SandboxBackend instances and clear the cache.
+
+    If a ``SandboxSessionManager`` is registered, evicts every cached
+    backend's sessions first (waits up to ``eviction_grace_seconds`` for
+    in-flight to drain, then marks-for-eviction). This closes the
+    close-during-use ambiguity on app shutdown: a session running when
+    shutdown begins gets a bounded window to finish before the backend
+    wrapper is torn down.
+    """
+    cached_backends = list(_BACKEND_CACHE.values())
+    if _session_manager is not None:
+        for backend in cached_backends:
+            try:
+                await _session_manager.evict_for_backend(backend)
+            except Exception:
+                logger.warning(
+                    "Error evicting sessions during close_all_backends for "
+                    f"backend={type(backend).__name__!r}",
+                    exc_info=True,
+                )
     for key, backend in list(_BACKEND_CACHE.items()):
         try:
             await backend.close()
@@ -422,16 +477,35 @@ async def close_all_backends() -> None:
 
 
 async def invalidate_backend_cache(backend_type: str) -> None:
-    """Remove all _BACKEND_CACHE entries for backend_type, closing each backend."""
+    """Remove all _BACKEND_CACHE entries for backend_type, closing each backend.
+
+    If a ``SandboxSessionManager`` is registered, evicts each backend's
+    sessions through the manager BEFORE calling ``backend.close()`` so that
+    in-flight executions see ``stop_session`` fire on release rather than
+    racing with backend teardown.
+    """
     evicted = 0
-    for key in [k for k in _BACKEND_CACHE if k[0] == backend_type]:
-        backend = _BACKEND_CACHE.pop(key, None)
+    matching_keys = [k for k in _BACKEND_CACHE if k[0] == backend_type]
+    if _session_manager is not None:
+        for cache_key in matching_keys:
+            backend = _BACKEND_CACHE.get(cache_key)
+            if backend is None:
+                continue
+            try:
+                await _session_manager.evict_for_backend(backend)
+            except Exception:
+                logger.warning(
+                    f"Error evicting sessions for backend {cache_key!r}",
+                    exc_info=True,
+                )
+    for cache_key in matching_keys:
+        backend = _BACKEND_CACHE.pop(cache_key, None)
         if backend is None:
             continue
         try:
             await backend.close()
         except Exception:
-            logger.warning(f"Error closing sandbox backend {key!r}", exc_info=True)
+            logger.warning(f"Error closing sandbox backend {cache_key!r}", exc_info=True)
         evicted += 1
     logger.debug(f"Invalidated {evicted} cache entries for backend_type={backend_type!r}")
 

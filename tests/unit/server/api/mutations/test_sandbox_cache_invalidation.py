@@ -26,11 +26,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import sqlalchemy as sa
 from pydantic import BaseModel, ConfigDict
 
+import phoenix.server.sandbox as sandbox_module
 from phoenix.db import models
 from phoenix.server.encryption import EncryptionService
 from phoenix.server.sandbox import (
     _BACKEND_CACHE,
     _SANDBOX_ADAPTERS,
+    close_all_backends,
     get_or_create_backend,
 )
 from phoenix.server.sandbox.types import (
@@ -74,7 +76,13 @@ _UPSERT_SECRETS_MUTATION = """
 
 
 class _CapturingAdapter(SandboxAdapter):
-    """Test adapter that records each build_backend invocation for later assertions."""
+    """Test adapter that records each build_backend invocation for later assertions.
+
+    Returned backends record start_session/stop_session/close ordering via
+    a shared ``call_log`` list (timestamp index → "start"/"stop"/"close")
+    so eviction-coordination tests can assert that ``stop_session`` fires
+    BEFORE ``close``. See ``TestSessionManagerEvictionCoordination`` below.
+    """
 
     config_model = _PermissiveTestConfig
 
@@ -92,6 +100,10 @@ class _CapturingAdapter(SandboxAdapter):
         self.credential_specs = credential_specs
         self.received_configs: list[dict[str, Any]] = []
         self.received_user_envs: list[dict[str, str] | None] = []
+        # Per-build call log shared back to the constructed backend so tests
+        # can assert relative ordering across start_session, stop_session,
+        # and close on a single backend instance.
+        self.built_backends: list[MagicMock] = []
 
     def build_backend(
         self,
@@ -101,7 +113,25 @@ class _CapturingAdapter(SandboxAdapter):
         self.received_configs.append(dict(config))
         self.received_user_envs.append(dict(user_env) if user_env else None)
         backend = MagicMock(spec=SandboxBackend)
-        backend.close = AsyncMock()
+        call_log: list[tuple[str, str]] = []
+
+        async def _start(session_key: str) -> None:
+            call_log.append(("start", session_key))
+
+        async def _stop(session_key: str) -> None:
+            call_log.append(("stop", session_key))
+
+        async def _close() -> None:
+            call_log.append(("close", ""))
+
+        backend.start_session = AsyncMock(side_effect=_start)
+        backend.stop_session = AsyncMock(side_effect=_stop)
+        backend.close = AsyncMock(side_effect=_close)
+        # Stash the log on the mock so tests can read it back. ``call_log``
+        # is a plain attribute on the MagicMock — not part of SandboxBackend
+        # spec, so accessing it via getattr is safe.
+        backend.call_log = call_log
+        self.built_backends.append(backend)
         return backend
 
 
@@ -375,3 +405,258 @@ class TestUpsertOrDeleteSecretsCacheInvalidation:
                 await session.execute(
                     sa.delete(models.Secret).where(models.Secret.key == secret_key)
                 )
+
+
+class TestSessionManagerEvictionCoordination:
+    """Phase 3 coverage: invalidation routes through the SandboxSessionManager.
+
+    The three Verification scenarios (from work-item
+    sandbox-session-manager-playground-session-reuse, phase 3):
+
+    1. ``setSandboxCredential`` with a pre-existing tracked session causes
+       the manager to ``stop_session`` BEFORE ``close()`` on the backend.
+    2. ``updateSandboxConfig`` with a pre-existing tracked session evicts
+       the session through the manager — regression coverage for the
+       orphaned-wrapper leak Phase 3 fixes.
+    3. ``close_all_backends`` drains in-flight sessions (bounded by
+       ``eviction_grace_seconds``) before closing wrappers — patches the
+       grace down to keep the test fast.
+
+    Tests rely on the ``gql_client`` fixture spinning up the FastAPI
+    lifespan, which calls ``register_session_manager(...)`` so the
+    module-level handle (``sandbox_module._session_manager``) is wired.
+    """
+
+    async def _seed_tracked_session(
+        self,
+        backend: SandboxBackend,
+        session_key: str,
+    ) -> Any:
+        """Acquire + release a session so the manager has a tracked entry."""
+        manager = sandbox_module._session_manager
+        assert manager is not None, (
+            "Lifespan did not register a SandboxSessionManager — check gql_client fixture"
+        )
+        async with manager.acquire(backend, session_key):
+            pass
+        return manager
+
+    async def test_credential_rotation_evicts_in_flight_session_through_manager(
+        self,
+        db: DbSessionFactory,
+        gql_client: AsyncGraphQLClient,
+    ) -> None:
+        """Rotating a credential fires manager.evict_for_backend → stop_session
+        runs BEFORE backend.close() on the cached wrapper."""
+        backend_type = "EVICT_ROTATE_TEST_BACKEND"
+        cred_key = "EVICT_ROTATE_TEST_CRED"
+        adapter = _CapturingAdapter(
+            key=backend_type,
+            credential_specs=[
+                ProviderCredentialSpec(key=cred_key, display_name="Evict Rotate Test"),
+            ],
+        )
+        enc = EncryptionService()
+
+        async with db() as session:
+            session.add(models.Secret(key=cred_key, value=enc.encrypt(b"v1")))
+
+        try:
+            with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
+                # Build + track a session so the manager has state to evict.
+                async with db() as session:
+                    backend = await get_or_create_backend(
+                        backend_type, config={}, session=session, decrypt=enc.decrypt
+                    )
+                assert backend is not None
+                manager = await self._seed_tracked_session(backend, "session-1")
+                assert manager is not None
+                # Sanity: start_session ran exactly once.
+                call_log: list[tuple[str, str]] = getattr(backend, "call_log")
+                assert call_log[0] == ("start", "session-1"), call_log
+
+                # Trigger rotation → invalidate_backend_cache_for_key →
+                # invalidate_backend_cache → manager.evict_for_backend →
+                # backend.stop_session (in_flight is 0 after release).
+                result = await gql_client.execute(
+                    query=_SET_CRED_MUTATION,
+                    variables={
+                        "input": {
+                            "backendType": backend_type,
+                            "key": cred_key,
+                            "value": "v2",
+                        }
+                    },
+                    operation_name="SetSandboxCredential",
+                )
+                assert not result.errors, result.errors
+
+                # Eviction-then-close ordering on the captured backend.
+                # The session is in_flight=0 at rotation time, so the manager
+                # closes it synchronously inside _evict_matching.
+                kinds = [k for k, _ in call_log]
+                assert "stop" in kinds, f"stop_session never ran: {call_log}"
+                assert "close" in kinds, f"close never ran: {call_log}"
+                assert kinds.index("stop") < kinds.index("close"), (
+                    f"stop_session must run BEFORE close: {call_log}"
+                )
+        finally:
+            _purge_cache_for([backend_type])
+
+    async def test_update_sandbox_config_evicts_session_through_manager(
+        self,
+        db: DbSessionFactory,
+        gql_client: AsyncGraphQLClient,
+    ) -> None:
+        """Updating a SandboxConfig invalidates the cached backend and evicts
+        any tracked session through the manager BEFORE close. Regression
+        coverage for the orphaned-wrapper leak (Phase 3 D5)."""
+        from strawberry.relay import GlobalID
+
+        from phoenix.server.api.types.SandboxConfig import SandboxConfig as SandboxConfigGQL
+
+        backend_type = "EVICT_UPDATE_TEST_BACKEND"
+        adapter = _CapturingAdapter(key=backend_type, credential_specs=[])
+
+        async with db() as session:
+            provider = models.SandboxProvider(
+                backend_type=backend_type,
+                language="PYTHON",
+                enabled=True,
+                config={},
+            )
+            session.add(provider)
+            await session.flush()
+            cfg = models.SandboxConfig(
+                sandbox_provider_id=provider.id,
+                language="PYTHON",
+                name="evict-update-test-config",
+                config={},
+                timeout=30,
+            )
+            session.add(cfg)
+            await session.flush()
+            cfg_global_id = str(GlobalID(SandboxConfigGQL.__name__, str(cfg.id)))
+
+        try:
+            with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
+                async with db() as session:
+                    backend = await get_or_create_backend(
+                        backend_type,
+                        config={},
+                        session=session,
+                        decrypt=EncryptionService().decrypt,
+                    )
+                assert backend is not None
+                await self._seed_tracked_session(backend, "session-1")
+                call_log: list[tuple[str, str]] = getattr(backend, "call_log")
+                assert ("start", "session-1") in call_log
+
+                # Update the SandboxConfig — Phase 3 wires this mutation to
+                # invalidate_backend_cache(provider.backend_type).
+                result = await gql_client.execute(
+                    query=(
+                        "mutation U($input: UpdateSandboxConfigInput!) { "
+                        "updateSandboxConfig(input: $input) { "
+                        "sandboxConfig { id name } } }"
+                    ),
+                    variables={
+                        "input": {
+                            "id": cfg_global_id,
+                            "timeout": 60,
+                        }
+                    },
+                    operation_name="U",
+                )
+                assert not result.errors, result.errors
+
+                kinds = [k for k, _ in call_log]
+                assert "stop" in kinds and "close" in kinds, (
+                    f"updateSandboxConfig did not fan out through the manager: {call_log}"
+                )
+                assert kinds.index("stop") < kinds.index("close"), (
+                    f"stop_session must run BEFORE close: {call_log}"
+                )
+        finally:
+            _purge_cache_for([backend_type])
+            async with db() as session:
+                await session.execute(
+                    sa.delete(models.SandboxConfig).where(
+                        models.SandboxConfig.name == "evict-update-test-config"
+                    )
+                )
+                await session.execute(
+                    sa.delete(models.SandboxProvider).where(
+                        models.SandboxProvider.backend_type == backend_type
+                    )
+                )
+
+    async def test_close_all_backends_drains_in_flight_then_closes(
+        self,
+        db: DbSessionFactory,
+        gql_client: AsyncGraphQLClient,
+    ) -> None:
+        """``close_all_backends`` waits up to ``eviction_grace_seconds`` for
+        in-flight sessions to drain; if the window expires they stay
+        marked-for-eviction and the wrapper is still closed.
+
+        Patches the grace down to ~0.1s so the test resolves quickly. An
+        Event-gated fake ``execute`` holds the session in-flight until the
+        test releases it, so timing is deterministic — no sleep loops.
+        """
+        import asyncio
+
+        backend_type = "EVICT_SHUTDOWN_TEST_BACKEND"
+        adapter = _CapturingAdapter(key=backend_type, credential_specs=[])
+        manager = sandbox_module._session_manager
+        assert manager is not None
+        original_grace = manager.eviction_grace_seconds
+        manager.eviction_grace_seconds = 0.1
+        try:
+            with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
+                async with db() as session:
+                    backend = await get_or_create_backend(
+                        backend_type,
+                        config={},
+                        session=session,
+                        decrypt=EncryptionService().decrypt,
+                    )
+                assert backend is not None
+
+                # Acquire a session, hold it in_flight, drive close_all_backends
+                # concurrently, then release the session. The manager's grace
+                # window is 0.1s — by the time we release ~0.2s later, the
+                # backend is marked-for-eviction; release fires stop_session.
+                release_event = asyncio.Event()
+
+                async def hold_session() -> None:
+                    async with manager.acquire(backend, "session-1"):
+                        await release_event.wait()
+
+                hold_task = asyncio.create_task(hold_session())
+                # Yield so the acquire actually progresses to in_flight > 0.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
+
+                # Drive shutdown — must not deadlock waiting for in_flight.
+                close_task = asyncio.create_task(close_all_backends())
+                # Give close_all_backends time to exhaust its grace window.
+                await asyncio.sleep(0.25)
+                # Release the session so the manager's _release fires
+                # stop_session (the entry is marked_for_eviction).
+                release_event.set()
+                await hold_task
+                await close_task
+
+                call_log: list[tuple[str, str]] = getattr(backend, "call_log")
+                kinds = [k for k, _ in call_log]
+                assert "start" in kinds
+                assert "close" in kinds, f"close never ran: {call_log}"
+                # stop_session fires from the release path (mark-for-eviction
+                # promoted on the in_flight=0 transition).
+                assert "stop" in kinds, (
+                    f"mark-for-eviction did not fire stop on release: {call_log}"
+                )
+        finally:
+            manager.eviction_grace_seconds = original_grace
+            _purge_cache_for([backend_type])
