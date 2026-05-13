@@ -187,7 +187,10 @@ async function ensureSandboxConfig(
   const providerName = await getEnabledProviderName(page, language);
 
   await page.getByRole("button", { name: "New Sandbox" }).click();
-  const dialog = page.getByRole("dialog");
+  // Anchor on `data-testid="dialog"` rather than role to avoid strict-mode
+  // matches against transient Select popovers (react-aria gives those
+  // role="dialog" while entering/exiting, which collides with this modal).
+  const dialog = page.getByTestId("dialog");
   await expect(
     dialog.getByRole("heading", { name: "New Sandbox Config" })
   ).toBeVisible();
